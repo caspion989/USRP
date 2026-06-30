@@ -1,5 +1,8 @@
 # CLAUDE.md
 
+
+dont act if you dont understand what im asking you to do and dont push or pull from git without my explicit command 
+
 This file gives Claude (and future-you) context on this project.
 
 ## What this project is
