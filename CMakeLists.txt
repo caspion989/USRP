@@ -13,5 +13,5 @@ set_target_properties(UHD::uhd PROPERTIES
 
 set(BOOST_LIB_DIR "C:/Users/2406h/radioconda/pkgs/libboost-1.86.0-hb0986bb_3/Library/lib")
 add_executable(usrp_to_grc main.cpp)
-target_link_libraries(usrp_to_grc PUBLIC UHD::uhd Ws2_32)
+target_link_libraries(usrp_to_grc PUBLIC UHD::uhd)
 target_link_directories(usrp_to_grc PUBLIC "${BOOST_LIB_DIR}")
