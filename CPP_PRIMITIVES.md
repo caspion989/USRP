@@ -176,6 +176,21 @@ actually there.
 | `acquire` | On a load: everything written before the matching release is now visible to this thread. |
 | `seq_cst` | Default. Total ordering across all threads. Safest, slowest. |
 
+### What acquire/release actually is
+
+**Acquire/release does not pause or wait** — it tells the CPU "do not reorder writes across this point", so one thread's writes are guaranteed to be visible to another thread in the correct order.
+
+Think of it as giving that variable change **highest priority visibility** — the moment the release store happens, all writes before it are immediately flushed and visible to any thread that does the matching acquire load. No thread can see a stale version after an acquire.
+
+```
+Without release/acquire:          With release/acquire:
+  CPU may reorder freely             writes before release are locked in order
+  other cores may see stale cache    acquiring thread sees everything immediately
+  data arrives "eventually"          data arrives at the exact acquire point
+```
+
+This is why it is used for the ring buffer indices — the moment the producer stores `write_idx` with `release`, the consumer's `acquire` load of `write_idx` is guaranteed to also see the slot data that was written before it.
+
 ---
 
 ## 5. `lock_guard` vs `unique_lock`
@@ -220,6 +235,15 @@ Never do heavy computation, disk I/O, or network calls while holding a lock.
 
 A condition variable lets a thread **sleep until another thread signals it**.
 It is always used together with a `mutex` — never alone.
+
+**One sentence each:**
+```
+mutex  — permission to enter: blocks if someone else is already inside
+CV     — reason to enter: blocks until there is actually something to do
+```
+
+The mutex stops you from running at the same time as another thread.
+The CV stops you from running when there is no work yet.
 
 ### Mutex vs condition variable — they solve different problems
 
