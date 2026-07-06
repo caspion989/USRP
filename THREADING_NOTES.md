@@ -281,3 +281,131 @@ while (true) {
 and the UHD parameters) to `float`. The inner loop uses `float` because
 `std::cos` / `std::sin` on `float` are faster than their `double` versions
 at 50 MS/s.
+
+---
+
+## 12. "Real-time" means a hard deadline, not just "fast"
+
+A real-time system has a task that must complete within a bounded time window.
+If it misses that window, the consequence is **data loss or failure** — not just slowness.
+
+For a USRP recv loop:
+- UHD maintains an internal DMA/USB ring buffer on the hardware side.
+- That buffer has a fixed size. If your thread doesn't call `recv()` again before
+  it fills, the hardware has nowhere to put new incoming data → samples are dropped (overflow).
+- The deadline is not written in your code — it is a property of the hardware buffer
+  size and the incoming sample rate.
+
+**Implication**: blocking the recv loop for *any* reason (mutex contention, condition
+variable wait, disk I/O) means missing a hard deadline, not just being slow.
+
+---
+
+## 13. Backpressure — right pattern, wrong context
+
+Backpressure means slowing the producer when the consumer can't keep up, to prevent
+unbounded memory growth. This is often the correct choice — in a network server,
+you'd rather slow down than run out of RAM.
+
+It is the **wrong choice** when the producer has a hard real-time deadline it cannot violate.
+
+```cpp
+// This looks safe (caps memory use) but is actually the bug:
+cv.wait(lock, [&] { return q.size() < MAX_DEPTH || stop; });
+```
+
+When the queue is full, the recv thread blocks here. While it is blocked, nobody is
+calling `recv()`, so UHD's hardware buffers fill up and overflow. The backpressure
+mechanism — intended to protect memory — is exactly what starves the receive loop.
+
+**Rule for RT recv loops: drop, never block.**
+When the consumer can't keep up, sacrifice some data (log it, count the drops) rather
+than ever stalling the producer.
+
+```cpp
+// RT-safe policy: if queue is full, drop the batch and continue immediately
+if (q.size() < MAX_DEPTH)
+    q.push(std::move(batch));
+else
+    ++dropped_batches;   // count it, never block
+```
+
+---
+
+## 14. Jitter — why blocking primitives hurt RT threads
+
+**Jitter** is the variance in how long an operation takes. In real-time systems,
+jitter matters more than average latency.
+
+`std::mutex` + `std::condition_variable` are **blocking primitives**:
+- A thread waiting in `cv.wait()` is suspended by the OS scheduler.
+- It only wakes when notified, plus additional scheduling delay to actually get CPU time.
+- Even the non-blocked path (briefly acquiring a mutex) can stall unpredictably if the
+  OS context-switches you out while you hold the lock, or if another thread contests it.
+
+`uhd::set_thread_priority_safe()` reduces jitter by raising the recv thread's OS
+scheduling priority — but that effort is undermined if the same thread then voluntarily
+blocks itself on a `cv.wait()`.
+
+---
+
+## 15. Priority inversion
+
+If a **high-priority thread** (recv loop, ideally RT/SCHED_FIFO priority) needs a lock
+currently held by a **low-priority thread** (CSV writer), the high-priority thread ends
+up waiting on the low-priority one — effectively inverting the priorities you asked the
+OS for.
+
+Mutex-protected shared queues between an RT thread and a non-RT thread are a classic
+setup for priority inversion.
+
+**Rule**: RT threads should avoid blocking on locks shared with non-RT threads.
+A lock-free SPSC ring buffer sidesteps this entirely — no lock, no inversion possible.
+
+---
+
+## 16. Binary I/O vs. formatted text — throughput impact
+
+Formatted text output (CSV) converts every float to ASCII decimal on every sample:
+
+```cpp
+file << sample.real() << ',' << sample.imag() << '\n';  // slow: float→text per sample
+```
+
+Binary output writes the raw bytes directly:
+
+```cpp
+file.write((const char*)buf, num_samples * sizeof(std::complex<float>));  // fast: memcpy speed
+```
+
+The difference is typically **5–10x less CPU and I/O work per sample**. A consumer
+doing less work per sample naturally keeps up with the producer more often, which means
+the drop-path (section 13) is hit less frequently even at high sample rates.
+
+---
+
+## 17. Better RT pipeline architecture
+
+| Component | Mutex + queue (flawed) | Lock-free SPSC ring buffer (RT-safe) |
+|---|---|---|
+| Producer blocks when full | yes — causes overflow | no — drops or overwrites |
+| Lock contention | yes | none |
+| OS scheduling involved | yes (cv.wait suspends thread) | no |
+| Memory allocation per batch | yes (vector push) | no (pre-allocated slots) |
+| Safe for >1 producer | yes | no — strictly 1 producer, 1 consumer |
+
+Minimum viable RT pipeline:
+```
+recv thread (RT priority):
+  recv() → local buffer
+  if ring buffer has space: write slot, advance write_idx (atomic release store)
+  else: increment drop counter, continue immediately
+
+DSP/write thread:
+  spin or yield until write_idx != read_idx  (atomic acquire load)
+  process slot
+  advance read_idx (atomic release store)
+```
+
+Never block the recv thread. Never do I/O or heavy processing inside the recv loop.
+

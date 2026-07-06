@@ -15,7 +15,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
-#include <cmath>
+#include <fstream>
 
 static std::atomic<bool> stop_signal_called(false);
 void sig_int_handler(int) { stop_signal_called = true; }
@@ -31,23 +31,18 @@ struct SampleQueue {
     static constexpr size_t MAX_DEPTH = 32;
 };
 
-// ─── DSP worker — runs on its own thread ─────────────
-// Pops batches from the queue and applies a frequency shift.
-// sample_offset tracks the absolute sample index across batches
-// so the complex exponential is continuous (no phase jump at batch edges).
-void dsp_worker(SampleQueue& sq, double f_shift_hz, double sample_rate)
+// ─── CSV writer — runs on its own thread ─────────────
+// Pops batches from the queue and writes each sample as
+// a "real,imag" line to samples.csv.
+void csv_writer(SampleQueue& sq)
 {
-    uhd::set_thread_priority_safe();   // give DSP thread RT priority too
-
-    const float two_pi_f_over_fs = static_cast<float>(2.0 * M_PI * f_shift_hz / sample_rate);
-    size_t sample_offset = 0;
+    std::ofstream file("samples.csv");
+    file << "real,imag\n";
 
     while (true) {
-        // ── Wait for a batch ──────────────────────────
         std::vector<std::complex<float>> batch;
         {
             std::unique_lock<std::mutex> lock(sq.mtx);
-            // Spurious-wake-up safe: predicate is re-checked after every wake.
             sq.cv.wait(lock, [&] {
                 return !sq.q.empty() || stop_signal_called.load();
             });
@@ -57,21 +52,10 @@ void dsp_worker(SampleQueue& sq, double f_shift_hz, double sample_rate)
             batch = std::move(sq.q.front());
             sq.q.pop();
         }
-        // Notify the producer in case it was blocking on MAX_DEPTH.
-        sq.cv.notify_one();
+        sq.cv.notify_one();   // unblock producer if it was waiting on MAX_DEPTH
 
-        // ── Frequency shift ───────────────────────────
-        // Multiply each sample by e^(j * 2π * f_shift * n / fs).
-        for (size_t i = 0; i < batch.size(); ++i) {
-            float phase = two_pi_f_over_fs * static_cast<float>(sample_offset + i);
-            batch[i] *= std::complex<float>(std::cos(phase), std::sin(phase));
-        }
-        sample_offset += batch.size();
-
-        // ── Your further processing goes here ─────────
-        // batch[] now contains frequency-shifted IQ samples.
-        // e.g. write to file, run FFT, demodulate, etc.
-        (void)batch;
+        for (const auto& sample : batch)
+            file << sample.real() << ',' << sample.imag() << '\n';
     }
 }
 
@@ -85,12 +69,10 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     std::string ant("RX2");
     std::string ref("internal");
 
-    double rate(50e6);
-    double freq(2450e6);
+    double rate(5e6);
+    double freq(1000e6);
     double gain(30);
-    double bw(50e6);
-
-    double f_shift_hz = 100e3; // Positive = shift up, negative = shift down.
+    double bw(5e6);
 
     std::printf("Creating the usrp device with: %s...\n", device_args.c_str());
     uhd::usrp::multi_usrp::sptr usrp = uhd::usrp::multi_usrp::make(device_args);
@@ -128,7 +110,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
 
     // ── Start the DSP thread ──────────────────────────
     SampleQueue sq;
-    std::thread dsp_thread(dsp_worker, std::ref(sq), f_shift_hz, rate);
+    std::thread dsp_thread(csv_writer, std::ref(sq));
 
     std::printf("Receiving -- press Ctrl+C to stop.\n\n");
 
