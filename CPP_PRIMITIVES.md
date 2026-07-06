@@ -221,6 +221,41 @@ Never do heavy computation, disk I/O, or network calls while holding a lock.
 A condition variable lets a thread **sleep until another thread signals it**.
 It is always used together with a `mutex` — never alone.
 
+### Mutex vs condition variable — they solve different problems
+
+A common question: **why do you need a CV if you already have a mutex?**
+They are not alternatives — they do completely different jobs:
+
+| | Mutex | Condition variable |
+|---|---|---|
+| Solves | Two threads touching shared data at the same time | A thread needing to sleep until a condition becomes true |
+| Mechanism | Block all other threads from entering the critical section | Sleep until another thread signals you |
+| Replaces the other? | No | No |
+
+You always need both. Remove either one and it breaks:
+
+```cpp
+// remove the mutex — data race on data_ready
+data_ready = true;           // producer writes
+cv.wait(lock, [] { return data_ready; });  // consumer reads simultaneously → crash
+
+// remove the CV — consumer must busy-loop, and causes a deadlock
+while (true) {
+    lock_guard<mutex> lock(mtx);
+    if (data_ready) break;   // holds the lock while spinning
+}                            // producer can never acquire mutex to set data_ready → deadlock
+
+// remove data_ready — no predicate, wakes on spurious OS signals
+cv.wait(lock);               // consumer proceeds even though no data exists
+```
+
+**The three roles together:**
+```
+mutex        — only one thread touches shared data at a time
+data_ready   — the actual condition being communicated
+CV           — sleep efficiently until the condition changes
+```
+
 ### The problem it solves
 
 Without a condition variable, a consumer thread that is waiting for data must
