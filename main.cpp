@@ -43,11 +43,9 @@ void csv_writer(SampleQueue& sq)
         std::vector<std::complex<float>> batch;
         {
             std::unique_lock<std::mutex> lock(sq.mtx);
-            sq.cv.wait(lock, [&] {
-                return !sq.q.empty() || stop_signal_called.load();
-            });
+            sq.cv.wait(lock, [&] {return !sq.q.empty() || stop_signal_called.load();}); //make sure sq is not empty before popping
 
-            if (sq.q.empty()) break;   // stopped and queue fully drained
+            if (sq.q.empty()) break;   // stopped and queue fully drained - active in case of shutdown
 
             batch = std::move(sq.q.front());
             sq.q.pop();
@@ -75,38 +73,38 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     double bw(5e6);
 
     std::printf("Creating the usrp device with: %s...\n", device_args.c_str());
-    uhd::usrp::multi_usrp::sptr usrp = uhd::usrp::multi_usrp::make(device_args);
+    uhd::usrp::multi_usrp::sptr usrp = uhd::usrp::multi_usrp::make(device_args); // create the USRP device instance
 
-    usrp->set_clock_source(ref);
-    usrp->set_rx_subdev_spec(subdev);
-    std::cout << "Using Device: " << usrp->get_pp_string() << std::endl;
+    usrp->set_clock_source(ref); // set the clock source to internal or external
+    usrp->set_rx_subdev_spec(subdev); // map the subdevice to the RX channel - there are divices with multiple RX channels, so we need to specify which one to use
+    std::cout << "Using Device: " << usrp->get_pp_string() << std::endl; // print the device information
 
-    usrp->set_rx_rate(rate);
+    usrp->set_rx_rate(rate); // set the RX sample rate
     std::printf("Actual RX Rate: %f Msps\n", usrp->get_rx_rate() / 1e6);
 
-    uhd::tune_request_t tune_request(freq);
-    usrp->set_rx_freq(tune_request);
+    uhd::tune_request_t tune_request(freq); // create a tune request for the desired frequency
+    usrp->set_rx_freq(tune_request); // set the RX frequency using the tune request
     std::printf("Actual RX Freq: %f MHz\n", usrp->get_rx_freq() / 1e6);
 
-    usrp->set_rx_gain(gain);
+    usrp->set_rx_gain(gain); // set the RX gain
     std::printf("Actual RX Gain: %f dB\n", usrp->get_rx_gain());
 
-    usrp->set_rx_bandwidth(bw);
+    usrp->set_rx_bandwidth(bw); // set the RX bandwidth
     std::printf("Actual RX Bandwidth: %f MHz\n", usrp->get_rx_bandwidth() / 1e6);
 
-    usrp->set_rx_antenna(ant);
+    usrp->set_rx_antenna(ant); // set the RX antenna
     std::printf("Actual RX Antenna: %s\n\n", usrp->get_rx_antenna().c_str());
 
-    uhd::stream_args_t stream_args("fc32");
-    uhd::rx_streamer::sptr rx_stream = usrp->get_rx_stream(stream_args);
+    uhd::stream_args_t stream_args("fc32"); // set the stream format to complex float32
+    uhd::rx_streamer::sptr rx_stream = usrp->get_rx_stream(stream_args); // create a RX streamer for the specified stream format
 
-    uhd::stream_cmd_t stream_cmd(uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
-    stream_cmd.stream_now = true;
-    rx_stream->issue_stream_cmd(stream_cmd);
+    uhd::stream_cmd_t stream_cmd(uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS); // create a stream command to start continuous streaming
+    stream_cmd.stream_now = true; 
+    rx_stream->issue_stream_cmd(stream_cmd); // issue the stream command to start streaming
 
     const size_t samples_per_packet = 1024;
     std::vector<std::complex<float>> recv_buf(samples_per_packet);
-    uhd::rx_metadata_t md;
+    uhd::rx_metadata_t md; // metadata object to hold information about the received samples
 
     // ── Start the DSP thread ──────────────────────────
     SampleQueue sq;
@@ -116,9 +114,9 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
 
     // ── Producer loop (this thread) ───────────────────
     while (!stop_signal_called) {
-        size_t num_rx_samps =
-            rx_stream->recv(&recv_buf.front(), recv_buf.size(), md, 3.0);
+        size_t num_rx_samps = rx_stream->recv(&recv_buf.front(), recv_buf.size(), md, 3.0);
 
+        // Check for errors in the received samples
         if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE) {
             std::cerr << "Receiver error: " << md.strerror() << std::endl;
             continue;
@@ -130,9 +128,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         {
             std::unique_lock<std::mutex> lock(sq.mtx);
             // Back-pressure: block if the DSP thread is too slow.
-            sq.cv.wait(lock, [&] {
-                return sq.q.size() < SampleQueue::MAX_DEPTH || stop_signal_called.load();
-            });
+            sq.cv.wait(lock, [&] {return sq.q.size() < SampleQueue::MAX_DEPTH || stop_signal_called.load();});
             sq.q.push(std::move(batch));
         }
         sq.cv.notify_one();   // wake the DSP thread

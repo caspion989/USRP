@@ -407,7 +407,76 @@ were multiple consumers, so every one of them wakes up and exits.
 
 ---
 
-## 8. Lambda functions
+## 8. `auto` — let the compiler deduce the type
+
+`auto` tells the compiler: "figure out the type of this variable from the value
+I'm assigning to it." The type is still fixed and checked at compile time — `auto`
+is NOT dynamic typing like Python. It just saves you from writing the type out.
+
+```cpp
+auto x = 5;              // compiler deduces int
+auto y = 3.14;           // compiler deduces double
+auto name = "hello";     // compiler deduces const char*
+```
+
+### Why it matters — long type names
+
+The real value shows up with verbose template types. These two lines are identical:
+
+```cpp
+std::queue<std::vector<std::complex<float>>>::iterator it = q.begin();  // painful
+auto it = q.begin();                                                     // same thing
+```
+
+In this project's loop:
+
+```cpp
+for (const auto& sample : batch)     // sample is std::complex<float>
+    file << sample.real() << ',' << sample.imag();
+```
+
+Writing `for (const std::complex<float>& sample : batch)` would be correct but
+noisier. `auto` deduces it.
+
+### `auto` with lambdas — the common case
+
+A lambda has no name you can write as a type, so `auto` is the *only* practical
+way to store one:
+
+```cpp
+auto f = [&] { return !q.empty(); };   // only auto can name this type
+```
+
+### The `&` and `const` still matter
+
+`auto` alone deduces a **value** (a copy). You usually want `const auto&` when
+iterating to avoid copying each element:
+
+```cpp
+for (auto sample : batch)         // COPIES every complex<float> — wasteful
+for (const auto& sample : batch)  // reference, no copy, read-only — preferred
+```
+
+| Form | Meaning |
+|---|---|
+| `auto x` | a copy of the value |
+| `auto& x` | a reference — can modify the original |
+| `const auto& x` | a read-only reference — no copy, cannot modify |
+
+### When NOT to use `auto`
+
+When the explicit type documents intent or you want a *specific* type:
+
+```cpp
+auto count = 0;          // int — fine
+size_t count = 0;        // clearer that this is an index/size
+float phase = compute(); // if compute() returns double, this forces float
+auto phase = compute();  // would silently be double — maybe not what you want
+```
+
+---
+
+## 9. Lambda functions
 
 A lambda is an **anonymous function** you define inline, right where you need it,
 instead of writing a separate named function somewhere else.
@@ -536,7 +605,88 @@ In this project `sq` is declared in `main()` and the thread is `join()`ed before
 
 ---
 
-## 8. Smart pointers — automatic memory management
+## 10. Namespaces — `::` vs `.`
+
+A namespace groups names (functions, classes, variables) under a common prefix
+so two libraries can each define something called `func` without colliding.
+
+```cpp
+namespace outer {
+    void fun() { ... }
+
+    namespace inner {
+        void func() { ... }
+    }
+}
+
+outer::inner::func();   // fully qualified call
+```
+
+### Why `::` and not `.`
+
+`.` accesses a member of an **actual object instance sitting in memory**.
+`::` resolves a **name at compile time** — no object is involved at all.
+
+```cpp
+sq.mtx.lock();        // sq is a real object → . accesses its member
+outer::inner::func();  // outer/inner are NOT objects — nothing to "." off of
+```
+
+`outer` and `inner` have no type, no memory address, no runtime existence —
+they are purely a compile-time bucket for organizing names. Writing
+`outer.inner.func()` is a compile error: `outer` is not a valid expression on
+its own without `::`.
+
+| | `::` | `.` |
+|---|---|---|
+| Used on | A type, namespace, or class name | An actual object/variable |
+| Resolved | At compile time | Refers to a runtime instance |
+| Example | `outer::inner::func()` | `sq.mtx.lock()` |
+
+### The three things `::` names in this project
+
+```cpp
+outer::inner::func();                    // namespace member
+SampleQueue::MAX_DEPTH;                  // class static member
+std::memory_order_acquire;               // nested enum value inside std
+std::vector<int>::iterator it = v.begin();  // nested TYPE inside a class template
+//         ^^^^^^^^^^^^^^^^^^^^^^^ :: — naming a type            . — calling a method
+```
+
+All share the same property: no object instance is involved on the left of `::` —
+you're naming something that belongs to the type or namespace itself.
+
+### `using namespace std;` — what it actually does and why avoid it
+
+```cpp
+using namespace std;
+vector<int> v;     // works — std:: is now optional
+cout << v.size();  // works too
+```
+
+It pulls **every** name from `std` into the current scope so you can drop the
+`std::` prefix. `main.cpp` does **not** do this — it writes `std::` explicitly
+everywhere. Reasons to prefer the explicit form:
+
+- **Name collisions**: if two included libraries both define e.g. `shared_ptr`,
+  `using namespace` on both makes the bare name ambiguous — a compile error.
+  `std::shared_ptr` is unambiguous regardless of what else is in scope.
+- **Clarity for the reader**: `std::cout` tells you exactly where `cout` comes
+  from without checking for `using` declarations elsewhere in the file.
+- **Never do it in a header file** — `using namespace std;` in a `.h` file
+  leaks into every file that `#include`s it, polluting scope you don't control.
+
+A common middle ground — import only the specific names you use:
+
+```cpp
+using std::cout;
+using std::vector;
+// only these two are unqualified; everything else still needs std::
+```
+
+---
+
+## 11. Smart pointers — automatic memory management
 
 ### The problem with raw pointers
 
@@ -690,3 +840,146 @@ std::lock_guard<std::mutex> lock(mtx);   // acquires mutex on construction
 Same idea as `unique_ptr` — the resource (lock / heap memory) is released
 automatically when the wrapper goes out of scope, regardless of how the scope
 exits (normal return, exception, early break).
+
+---
+
+## 12. Containers for SDR samples in a real-time path
+
+The single rule that governs every choice here:
+
+> **Allocate memory once at startup. The hot loop only reads and writes into
+> already-allocated space — never allocates.**
+
+Any allocation inside the receive loop is unbounded latency, which means a missed
+`recv()` deadline, which means a hardware overflow (see [THREADING_NOTES.md]).
+
+---
+
+### Tier 1 — the receive buffer
+
+**`std::array<std::complex<float>, N>`** — when the packet size is a compile-time
+constant. Best option: lives on the stack, zero heap allocation, contiguous.
+
+```cpp
+std::array<std::complex<float>, 1024> recv_buf;   // no heap allocation at all
+rx_stream->recv(recv_buf.data(), recv_buf.size(), md, 3.0);
+```
+
+**`std::vector<std::complex<float>>`** — when the size is chosen at runtime.
+This is what `main.cpp` uses. Contiguous, gives a raw pointer via `.data()` /
+`.front()`, cache-friendly.
+
+```cpp
+std::vector<std::complex<float>> recv_buf(samples_per_packet);  // allocated ONCE
+// ... reused every iteration of the loop ...
+rx_stream->recv(&recv_buf.front(), recv_buf.size(), md, 3.0);
+```
+
+**Discipline**: create it *outside* the loop and reuse it. Never `push_back` in
+the hot path — a reallocation mid-stream stalls the receive loop.
+
+---
+
+### Tier 2 — the thread-to-thread hand-off
+
+**Lock-free SPSC ring buffer** — the RT-correct way to pass samples from the recv
+thread to a DSP thread at high rates. Pre-allocated fixed slots → zero allocation
+after startup, no mutex → no jitter or priority inversion.
+
+```cpp
+boost::lockfree::spsc_queue<std::complex<float>>   // or a custom fixed-slot ring
+```
+
+This is what replaces the current `std::queue` + mutex + condvar when going
+real-time. (See the ring buffer section in [THREADING_NOTES.md].)
+
+**`std::queue` + mutex + condvar** — the current design. Fine for writing to disk
+because the disk is the bottleneck, not the queue. But it allocates a new vector
+per batch, which the ring buffer eliminates.
+
+---
+
+### Tier 3 — accumulating a window for block processing (FFT)
+
+**`std::vector` with `reserve()`** — when you collect N samples before an FFT.
+`reserve()` pre-allocates capacity once, so later fills don't reallocate.
+
+```cpp
+std::vector<std::complex<float>> window;
+window.reserve(fft_size);   // allocate capacity ONCE, up front
+// fill without reallocating
+```
+
+---
+
+### What to avoid in the hot path
+
+| Container | Why avoid for RT samples |
+|---|---|
+| `std::list` / `std::deque` | Non-contiguous — cache-hostile, per-element allocation |
+| `std::map` / `std::unordered_map` | Samples are a stream, not keyed lookups — wrong tool |
+| `std::vector` + `push_back` with no `reserve` | Reallocates mid-stream → latency spike → overflow |
+| Anything `new`ed inside the loop | Allocation = unbounded latency = missed deadline |
+
+---
+
+### Decision table
+
+| Situation | Container |
+|---|---|
+| Fixed packet size, receive buffer | `std::array<complex<float>, N>` |
+| Runtime-chosen size, receive buffer | `std::vector` sized once, reused |
+| Thread-to-thread hand-off at high rate | Lock-free SPSC ring buffer |
+| Thread-to-thread hand-off to disk (current) | `std::queue` + mutex (disk is the bottleneck) |
+| Accumulating a window for FFT | `std::vector` with `reserve()` |
+
+Why contiguous memory (`array` / `vector`) wins for samples: UHD's `recv()` writes
+straight into your buffer via a pointer, and DSP loops walk the samples linearly —
+both are fastest when the data sits in one unbroken, cache-friendly block.
+
+---
+
+## 13. `std::ref` / `std::reference_wrapper` — smuggling a reference through code that copies
+
+Easy to miss because it's a tiny library utility (from `<functional>`), not a
+language keyword — it doesn't jump out the way `auto` or `&` does. But it's a
+distinct, load-bearing primitive, not just decoration on a function call.
+
+**The problem it solves**: several standard facilities — `std::thread`,
+`std::bind`, `std::async`, `std::make_pair` — take their arguments **by value**
+internally. They copy or move each argument into their own storage before
+using it. That's a hard rule of how they're implemented; it has nothing to do
+with the type you're passing.
+
+If the function you actually want to call takes a reference parameter (like
+`csv_writer(SampleQueue& sq)`), and you hand `sq` directly to `std::thread`,
+`std::thread` tries to **copy** `sq` — not bind a reference to it. If the type
+isn't copyable (as here, `SampleQueue` holds a `std::mutex`), that's a compile
+error. If it *were* copyable, you'd get a silent, probably-unwanted copy: the
+new thread would mutate its own private `SampleQueue`, and the producer thread
+would never see any of it.
+
+```cpp
+std::thread dsp_thread(csv_writer, sq);           // won't compile: tries to copy sq
+std::thread dsp_thread(csv_writer, std::ref(sq)); // works: reference is preserved
+```
+
+**How it works**: `std::ref(sq)` doesn't return a reference — you can't store
+a real reference in a variable or a container, references aren't objects.
+Instead it returns a `std::reference_wrapper<SampleQueue>`: a small, ordinary,
+copyable object that just holds a pointer to `sq` under the hood. `std::thread`
+copies *that* freely (copying a pointer-sized wrapper is cheap and always
+legal). Then, when `std::thread` actually invokes `csv_writer`, it uses
+"INVOKE" semantics — the standard's rule for how callables get called — which
+specifically knows to unwrap a `reference_wrapper` back into a real reference
+before passing it on. So `csv_writer` ends up with a genuine `SampleQueue&`
+bound to the original `sq`, not a copy.
+
+There's also `std::cref(sq)` — the same idea, but produces a
+`reference_wrapper<const SampleQueue>`, for when the callee takes `const T&`.
+
+**Rule of thumb**: any time you're passing an argument through `std::thread`,
+`std::bind`, or `std::async`, and the target function expects a reference,
+wrap the argument in `std::ref` (or `std::cref`). Passing it plain either
+fails to compile (non-copyable types) or silently copies (copyable types) —
+neither gives you the shared-reference behavior you wanted.
