@@ -409,3 +409,79 @@ DSP/write thread:
 
 Never block the recv thread. Never do I/O or heavy processing inside the recv loop.
 
+---
+
+## 18. Avoiding dropped samples while still doing FFT
+
+The FFT consumer (`fft()` in `main.cpp`) currently guards with
+`if (batch.size() != samples_per_packet) continue;` — a radix-2 FFT needs a
+fixed power-of-2 length, so any batch that isn't exactly 4096 samples is
+skipped.
+
+Reframe first: the short-read guard doesn't *lose* samples from the hardware —
+the producer received them and put them in a batch. The FFT thread just chooses
+not to *analyze* that one odd-sized frame. In steady continuous streaming,
+`recv()` almost always returns full 4096-sample buffers — short reads are rare
+(startup, just after an overflow, or a timeout). So today's "drop" is a rare
+skipped analysis frame, not a steady hemorrhage of data.
+
+Options that skip nothing, cleanest to lightest:
+
+### Option A — Accumulate a collecting window (the proper fix)
+
+Keep a persistent buffer that lives *across* loop iterations. Every incoming
+batch — whatever its size — gets appended to it. Whenever the buffer has ≥ N
+samples, slice off exactly N for the FFT and keep the leftover for next time.
+
+```
+persistent window (survives iterations)
+  ← append batch (any size, every batch)
+  when window has ≥ FFT_N:
+      take FFT_N samples → FFT → act on them
+      keep the remainder for the next window
+```
+
+- **No samples ever skipped** — every sample flows into the accumulator and
+  eventually into an FFT.
+- **The FFT always gets exactly N real samples**, so the power-of-2 requirement
+  is always satisfied regardless of how `recv()` chunked the data. The size
+  guard disappears entirely.
+- **Bonus (ties back to resolution)**: decouples FFT size from recv batch size.
+  You could accumulate 16384 or 65536 *real* samples before transforming —
+  which improves *true* resolution (not just interpolated bin spacing). This is
+  the real way to get finer resolution.
+- This is the "Tier 3 — accumulating a window for block processing (FFT)"
+  pattern in `CPP_PRIMITIVES.md` (`std::vector` with `reserve()`).
+- **Cost**: a bit more bookkeeping (tracking leftover samples, deciding overlap
+  vs. non-overlapping windows).
+
+### Option B — Separate the sample-action from the FFT
+
+If the "action on the samples" doesn't need the FFT to have run on *that exact
+frame*, move the per-sample processing *above* the size guard. Then every
+batch's samples get processed, and only the FFT itself skips odd frames.
+
+- **Simplest change** — the guard stays but wraps only the FFT, not the sample
+  handling.
+- **Only makes sense if** the sample action is independent of the FFT verdict.
+  If you need "FFT this frame → then act on this same frame's samples," use A.
+
+### Option C — Zero-pad the short batch instead of skipping it
+
+There is already a zeroed `padded` buffer. Instead of `continue` on a short
+read, copy however many samples arrived into it and FFT anyway.
+
+- **Never skips**, uses all samples, tiny change (delete the guard, clamp the
+  copy length).
+- **Cost**: on those rare short frames the real-sample count is lower, so that
+  frame's true resolution is worse and the magnitude normalization is slightly
+  off. Acceptable precisely because it's rare — but it's the "dirtier" option.
+
+### Recommendation
+
+**Option A** is the correct answer for "don't waste samples *and* keep doing
+FFT," and it also unlocks better true resolution — double duty. B and C are
+lighter but are workarounds rather than fixes. The deciding question before
+implementing: **does the "action on the samples" need the FFT result of the
+*same* samples it acts on?** If yes → Option A. If the action is independent of
+which frame the FFT saw → Option B is much simpler.
