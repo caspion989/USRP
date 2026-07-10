@@ -16,6 +16,10 @@
 #include <condition_variable>
 #include <queue>
 #include <fstream>
+#include <cmath>
+#include <cstdint>
+#include <chrono>
+#include <algorithm>
 
 static std::atomic<bool> stop_signal_called(false);
 void sig_int_handler(int) { stop_signal_called = true; }
@@ -31,13 +35,64 @@ struct SampleQueue {
     static constexpr size_t MAX_DEPTH = 32;
 };
 
-// ─── CSV writer — runs on its own thread ─────────────
-// Pops batches from the queue and writes each sample as
-// a "real,imag" line to samples.csv.
-void csv_writer(SampleQueue& sq)
+
+// ─── In-place iterative radix-2 Cooley-Tukey FFT ─────
+// Transforms `a` from time domain to frequency domain, in place.
+// a.size() MUST be a power of 2 (caller guarantees this).
+void fft_inplace(std::vector<std::complex<float>>& a)
 {
-    std::ofstream file("samples.csv");
-    file << "real,imag\n";
+    const size_t n = a.size();
+    if (n <= 1) return;
+
+    // Step 1: bit-reversal permutation — reorder samples so the butterflies
+    // below can run in place. (Standard iterative-FFT reordering.)
+    for (size_t i = 1, j = 0; i < n; ++i) {
+        size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1)
+            j ^= bit;
+        j ^= bit;
+        if (i < j)
+            std::swap(a[i], a[j]);
+    }
+
+    // Step 2: butterfly stages, doubling the transform length each pass.
+    // acos(-1.0) == pi — avoids the MSVC M_PI-not-defined gotcha.
+    const double two_pi = 2.0 * std::acos(-1.0);
+    for (size_t len = 2; len <= n; len <<= 1) {
+        double ang = -two_pi / static_cast<double>(len);   // negative angle = forward FFT
+        std::complex<float> wlen(static_cast<float>(std::cos(ang)),
+                                 static_cast<float>(std::sin(ang)));
+        for (size_t i = 0; i < n; i += len) {
+            std::complex<float> w(1.0f, 0.0f);
+            for (size_t k = 0; k < len / 2; ++k) {
+                std::complex<float> u = a[i + k];
+                std::complex<float> v = a[i + k + len / 2] * w;
+                a[i + k]           = u + v;
+                a[i + k + len / 2] = u - v;
+                w *= wlen;   // advance the twiddle factor
+            }
+        }
+    }
+}
+
+void fft(SampleQueue& sq, size_t samples_per_packet, double rate, double center_freq)
+{
+    auto last_print = std::chrono::steady_clock::now();
+
+    // Zero-padding: run the FFT on more points than we have real samples.
+    // This does NOT add true resolution (that is fixed by the real sample
+    // count / observation time) — it interpolates the spectrum, giving finer
+    // bin spacing so a single peak can be located more precisely.
+    const size_t ZERO_PAD_FACTOR = 4;                       // 4x -> 16384-point FFT
+    const size_t fft_size = samples_per_packet * ZERO_PAD_FACTOR;
+    std::vector<std::complex<float>> padded(fft_size);      // allocated ONCE, reused
+
+    const double true_res    = rate / static_cast<double>(samples_per_packet);
+    const double bin_spacing = rate / static_cast<double>(fft_size);
+    std::printf("FFT: %zu real samples zero-padded to %zu points\n"
+                "  New bin spacing (interpolated): %.1f Hz\n"
+                "  True resolution (unchanged):    %.1f Hz\n\n",
+                samples_per_packet, fft_size, bin_spacing, true_res);
 
     while (true) {
         std::vector<std::complex<float>> batch;
@@ -48,12 +103,56 @@ void csv_writer(SampleQueue& sq)
             if (sq.q.empty()) break;   // stopped and queue fully drained - active in case of shutdown
 
             batch = std::move(sq.q.front());
-            sq.q.pop();
+            sq.q.pop(); // remove the batch from the queue
         }
         sq.cv.notify_one();   // unblock producer if it was waiting on MAX_DEPTH
 
-        for (const auto& sample : batch)
-            file << sample.real() << ',' << sample.imag() << '\n';
+        // A short recv() read can hand us a batch smaller than samples_per_packet.
+        // Skip those so the zero-padded copy below always has the same real length.
+        if (batch.size() != samples_per_packet)
+            continue;
+
+        // Zero-pad: copy the real samples into the front, leave the tail as zeros.
+        // (Re-zero every iteration because fft_inplace overwrote the buffer last time.)
+        std::fill(padded.begin(), padded.end(), std::complex<float>(0.0f, 0.0f));
+        std::copy(batch.begin(), batch.end(), padded.begin());
+
+        fft_inplace(padded);   // padded now holds frequency-domain bins
+
+        // Find the strongest bin, skipping DC (bin 0). Direct-conversion
+        // receivers like the B205mini put an LO-leakage / DC-offset spike at
+        // bin 0 (the tuned center frequency), which would otherwise always win.
+        const size_t n = padded.size();
+        size_t peak_bin  = 1;
+        float  peak_mag2 = std::norm(padded[1]);   // norm() = |z|^2, no sqrt
+        for (size_t k = 2; k < n; ++k) {
+            float m2 = std::norm(padded[k]);
+            if (m2 > peak_mag2) {
+                peak_mag2 = m2;
+                peak_bin  = k;
+            }
+        }
+
+        // Convert bin index → signed baseband offset in Hz. Zero-padding does not
+        // change the sample rate, so bin spacing is rate / fft_size.
+        // Bins [0 .. n/2) are positive offsets; bins [n/2 .. n) are negative.
+        double bin_index = (peak_bin < n / 2)
+                               ? static_cast<double>(peak_bin)
+                               : static_cast<double>(peak_bin) - static_cast<double>(n);
+        double freq_offset = bin_index * rate / static_cast<double>(n);
+        double signal_freq = center_freq + freq_offset;
+
+        // Throttle console output to ~1 Hz. At 5 MSPS / 4096 the FFT runs
+        // ~1200x/second; printing every result would bottleneck this thread
+        // and stall the producer (same trap the CSV writer had).
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_print >= std::chrono::seconds(1)) {
+            last_print = now;
+            // Normalize by the REAL sample count — zero-padding adds no energy.
+            double magnitude = std::sqrt(peak_mag2) / static_cast<double>(samples_per_packet);
+            std::printf("Peak: %.4f MHz  (offset %+.1f kHz, bin %zu, mag %.4f)\n",
+                        signal_freq / 1e6, freq_offset / 1e3, peak_bin, magnitude);
+        }
     }
 }
 
@@ -102,13 +201,13 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     stream_cmd.stream_now = true; 
     rx_stream->issue_stream_cmd(stream_cmd); // issue the stream command to start streaming
 
-    const size_t samples_per_packet = 1024;
+    const size_t samples_per_packet = 4096;
     std::vector<std::complex<float>> recv_buf(samples_per_packet);
     uhd::rx_metadata_t md; // metadata object to hold information about the received samples
 
     // ── Start the DSP thread ──────────────────────────
     SampleQueue sq;
-    std::thread dsp_thread(csv_writer, std::ref(sq));
+    std::thread dsp_thread(fft, std::ref(sq), samples_per_packet, rate, freq);
 
     std::printf("Receiving -- press Ctrl+C to stop.\n\n");
 
@@ -129,7 +228,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
             std::unique_lock<std::mutex> lock(sq.mtx);
             // Back-pressure: block if the DSP thread is too slow.
             sq.cv.wait(lock, [&] {return sq.q.size() < SampleQueue::MAX_DEPTH || stop_signal_called.load();});
-            sq.q.push(std::move(batch));
+            sq.q.push(std::move(batch)); 
         }
         sq.cv.notify_one();   // wake the DSP thread
     }
