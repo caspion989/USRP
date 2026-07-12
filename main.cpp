@@ -155,9 +155,7 @@ void fft(SampleQueue& sq, size_t samples_per_packet, double rate, double center_
 
         // Convert bin index → signed baseband offset in Hz.
         // Bins [0 .. n/2) are positive offsets; bins [n/2 .. n) are negative.
-        double bin_index = (peak_bin < n / 2)
-                               ? static_cast<double>(peak_bin)
-                               : static_cast<double>(peak_bin) - static_cast<double>(n);
+        double bin_index = (peak_bin < n / 2) ? static_cast<double>(peak_bin) : static_cast<double>(peak_bin) - static_cast<double>(n);
         double freq_offset = bin_index * rate / static_cast<double>(n);
         double signal_freq = center_freq + freq_offset;
 

@@ -983,3 +983,75 @@ There's also `std::cref(sq)` — the same idea, but produces a
 wrap the argument in `std::ref` (or `std::cref`). Passing it plain either
 fails to compile (non-copyable types) or silently copies (copyable types) —
 neither gives you the shared-reference behavior you wanted.
+
+---
+
+## 14. `static_cast` — explicit, checked type conversion
+
+`static_cast<T>(expr)` converts `expr` to type `T`, checked by the compiler at
+compile time for related/convertible types (numeric conversions, pointer
+up/downcasts within a class hierarchy, etc.). It's the modern C++ replacement
+for the old C-style cast `(T)expr` — same job, but restricted to conversions
+the compiler can verify make sense, and instantly greppable (searching for
+`static_cast` finds every explicit conversion in the file; searching for
+`(double)` does not).
+
+### The bug it prevents: unsigned subtraction wraparound
+
+This is the case that actually matters in `main.cpp`, not just style. From the
+FFT peak-bin-to-frequency conversion:
+
+```cpp
+double bin_index = (peak_bin < n / 2)
+                       ? static_cast<double>(peak_bin)
+                       : static_cast<double>(peak_bin) - static_cast<double>(n);
+```
+
+`peak_bin` and `n` are both `size_t` — **unsigned**. If the subtraction ran in
+`size_t` arithmetic instead:
+
+```cpp
+size_t bad = peak_bin - n;   // peak_bin < n here, so this "should" be negative
+```
+
+it does **not** become negative — unsigned subtraction that would go below
+zero **wraps around** to a huge positive number instead (the same wraparound
+behavior covered for `uint32_t` sample counters elsewhere in this project).
+`peak_bin - n` would silently produce something like
+`18446744073709551516` instead of `-100`.
+
+By casting **both operands to `double` before subtracting**
+(`static_cast<double>(peak_bin) - static_cast<double>(n)`), the subtraction
+runs in signed floating-point arithmetic, where negative results work
+correctly. The cast isn't decoration here — it's what makes the negative-
+frequency-bin case (bins in the upper half of the FFT output, representing
+frequencies below center) compute correctly at all.
+
+### Why not just let the compiler convert implicitly?
+
+```cpp
+double x = peak_bin;              // implicit — compiles, but silent
+double y = static_cast<double>(peak_bin);   // explicit — same result, documents intent
+```
+
+Both produce the same value here. The difference shows up when a conversion
+is *lossy* or *dangerous* — e.g. `size_t` → `float` can lose precision for
+large values, or `double` → `int` truncates. An implicit conversion does this
+silently; some compilers warn, some don't. `static_cast` doesn't prevent the
+conversion, but it marks the spot as "this narrowing/conversion is
+intentional," and is exactly what to search for when hunting a numeric bug.
+
+### `static_cast` vs the other C++ casts
+
+`main.cpp` only uses `static_cast`, but it's worth knowing what it's *not*:
+
+| Cast | Use for |
+|---|---|
+| `static_cast<T>` | Related types: numeric conversions, known-safe pointer/reference conversions |
+| `const_cast<T>` | Adding/removing `const` — rarely needed, usually a design smell |
+| `reinterpret_cast<T>` | Reinterpreting raw bits (e.g. pointer to unrelated type) — low-level, dangerous |
+| `dynamic_cast<T>` | Safe downcast through polymorphic (virtual) class hierarchies, checked at runtime |
+| `(T)expr` (C-style) | Avoid — silently picks whichever of the above is "needed," no safety net |
+
+For everything in this project (numeric conversions between `size_t`,
+`double`, `float`), `static_cast` is the only one that's ever relevant.
