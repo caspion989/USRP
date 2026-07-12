@@ -30,9 +30,13 @@ struct SampleQueue {
     std::queue<std::vector<std::complex<float>>> q;
     std::mutex mtx;
     std::condition_variable cv;
-    // Back-pressure limit: if the DSP thread falls behind this many
-    // batches the producer blocks rather than growing without bound.
-    static constexpr size_t MAX_DEPTH = 32;
+    // Back-pressure limit: the producer blocks rather than growing the queue
+    // without bound once this many batches are pending. Sized to absorb the
+    // periodic FFT burst: while the DSP thread computes one 524288-point FFT
+    // (tens of ms, not draining the queue), the producer keeps pushing at
+    // ~1221 batches/sec. 256 batches = 256*4096/5e6 ≈ 210 ms of buffering,
+    // comfortably above the ~105 ms window-fill/FFT ceiling → no overflow.
+    static constexpr size_t MAX_DEPTH = 256;
 };
 
 
@@ -77,22 +81,22 @@ void fft_inplace(std::vector<std::complex<float>>& a)
 
 void fft(SampleQueue& sq, size_t samples_per_packet, double rate, double center_freq)
 {
-    auto last_print = std::chrono::steady_clock::now();
+    // Accumulate this many REAL samples per FFT evaluation. No zero-padding:
+    // the whole window is real data, so this gives TRUE resolution rate/N.
+    // 2^19 = 524288 samples ≈ 0.105 s at 5 MSPS → ~9.5 evals/sec, ~9.5 Hz res.
+    // MUST be a power of 2 (radix-2 FFT) AND a whole multiple of
+    // samples_per_packet so the window fills to exactly FFT_SIZE.
+    // (524288 = 128 × 4096.)
+    const size_t FFT_SIZE = 524288;
 
-    // Zero-padding: run the FFT on more points than we have real samples.
-    // This does NOT add true resolution (that is fixed by the real sample
-    // count / observation time) — it interpolates the spectrum, giving finer
-    // bin spacing so a single peak can be located more precisely.
-    const size_t ZERO_PAD_FACTOR = 4;                       // 4x -> 16384-point FFT
-    const size_t fft_size = samples_per_packet * ZERO_PAD_FACTOR;
-    std::vector<std::complex<float>> padded(fft_size);      // allocated ONCE, reused
+    std::vector<std::complex<float>> window;
+    window.reserve(FFT_SIZE);   // allocate capacity ONCE; cleared & refilled per cycle
 
-    const double true_res    = rate / static_cast<double>(samples_per_packet);
-    const double bin_spacing = rate / static_cast<double>(fft_size);
-    std::printf("FFT: %zu real samples zero-padded to %zu points\n"
-                "  New bin spacing (interpolated): %.1f Hz\n"
-                "  True resolution (unchanged):    %.1f Hz\n\n",
-                samples_per_packet, fft_size, bin_spacing, true_res);
+    const double resolution = rate / static_cast<double>(FFT_SIZE);   // Hz per bin (true)
+    std::printf("FFT: accumulating %zu real samples per evaluation\n"
+                "  Eval rate:       %.2f /sec\n"
+                "  True resolution: %.2f Hz\n\n",
+                FFT_SIZE, resolution, resolution);   // eval rate == resolution == rate/N
 
     while (true) {
         std::vector<std::complex<float>> batch;
@@ -107,34 +111,34 @@ void fft(SampleQueue& sq, size_t samples_per_packet, double rate, double center_
         }
         sq.cv.notify_one();   // unblock producer if it was waiting on MAX_DEPTH
 
-        // A short recv() read can hand us a batch smaller than samples_per_packet.
-        // Skip those so the zero-padded copy below always has the same real length.
-        if (batch.size() != samples_per_packet)
-            continue;
+        // Append this batch to the accumulation window. On a short recv() read
+        // (batch smaller than samples_per_packet), zero-fill the missing tail so
+        // the window still advances in clean samples_per_packet steps and lands
+        // on exactly FFT_SIZE — instead of dropping the incomplete batch.
+        window.insert(window.end(), batch.begin(), batch.end()); 
+        if (batch.size() < samples_per_packet)
+            window.insert(window.end(), samples_per_packet - batch.size(), std::complex<float>(0.0f, 0.0f));
 
-        // Zero-pad: copy the real samples into the front, leave the tail as zeros.
-        // (Re-zero every iteration because fft_inplace overwrote the buffer last time.)
-        std::fill(padded.begin(), padded.end(), std::complex<float>(0.0f, 0.0f));
-        std::copy(batch.begin(), batch.end(), padded.begin());
+        if (window.size() < FFT_SIZE)
+            continue;   // window not full yet — keep collecting batches
 
-        fft_inplace(padded);   // padded now holds frequency-domain bins
+        fft_inplace(window);   // window now holds FFT_SIZE frequency-domain bins
 
         // Find the strongest bin, skipping DC (bin 0). Direct-conversion
         // receivers like the B205mini put an LO-leakage / DC-offset spike at
         // bin 0 (the tuned center frequency), which would otherwise always win.
-        const size_t n = padded.size();
+        const size_t n = window.size();
         size_t peak_bin  = 1;
-        float  peak_mag2 = std::norm(padded[1]);   // norm() = |z|^2, no sqrt
+        float  peak_mag2 = std::norm(window[1]);   // norm() = |z|^2, no sqrt
         for (size_t k = 2; k < n; ++k) {
-            float m2 = std::norm(padded[k]);
+            float m2 = std::norm(window[k]);
             if (m2 > peak_mag2) {
                 peak_mag2 = m2;
                 peak_bin  = k;
             }
         }
 
-        // Convert bin index → signed baseband offset in Hz. Zero-padding does not
-        // change the sample rate, so bin spacing is rate / fft_size.
+        // Convert bin index → signed baseband offset in Hz.
         // Bins [0 .. n/2) are positive offsets; bins [n/2 .. n) are negative.
         double bin_index = (peak_bin < n / 2)
                                ? static_cast<double>(peak_bin)
@@ -142,17 +146,11 @@ void fft(SampleQueue& sq, size_t samples_per_packet, double rate, double center_
         double freq_offset = bin_index * rate / static_cast<double>(n);
         double signal_freq = center_freq + freq_offset;
 
-        // Throttle console output to ~1 Hz. At 5 MSPS / 4096 the FFT runs
-        // ~1200x/second; printing every result would bottleneck this thread
-        // and stall the producer (same trap the CSV writer had).
-        auto now = std::chrono::steady_clock::now();
-        if (now - last_print >= std::chrono::seconds(1)) {
-            last_print = now;
-            // Normalize by the REAL sample count — zero-padding adds no energy.
-            double magnitude = std::sqrt(peak_mag2) / static_cast<double>(samples_per_packet);
-            std::printf("Peak: %.4f MHz  (offset %+.1f kHz, bin %zu, mag %.4f)\n",
-                        signal_freq / 1e6, freq_offset / 1e3, peak_bin, magnitude);
-        }
+        double magnitude = std::sqrt(peak_mag2) / static_cast<double>(n);
+        std::printf("Peak: %.5f MHz  (offset %+.3f kHz, bin %zu, mag %.4f)\n",
+                    signal_freq / 1e6, freq_offset / 1e3, peak_bin, magnitude);
+
+        window.clear();   // start the next (non-overlapping) window; keeps capacity
     }
 }
 
