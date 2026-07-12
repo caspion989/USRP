@@ -87,16 +87,24 @@ void fft(SampleQueue& sq, size_t samples_per_packet, double rate, double center_
     // MUST be a power of 2 (radix-2 FFT) AND a whole multiple of
     // samples_per_packet so the window fills to exactly FFT_SIZE.
     // (524288 = 128 × 4096.)
-    const size_t FFT_SIZE = 524288;
+    const size_t FFT_SIZE = 524288;   // 2^19
 
     std::vector<std::complex<float>> window;
     window.reserve(FFT_SIZE);   // allocate capacity ONCE; cleared & refilled per cycle
 
     const double resolution = rate / static_cast<double>(FFT_SIZE);   // Hz per bin (true)
+    // Budget: how long the producer takes to fill one window. If fft_inplace()
+    // ever takes longer than this, the consumer falls behind on AVERAGE, not
+    // just in bursts — the queue climbs to MAX_DEPTH and stays there, which is
+    // what causes sustained ERROR_CODE_OVERFLOW (see THREADING_NOTES.md §13/18).
+    const double budget_ms = static_cast<double>(FFT_SIZE) / rate * 1000.0;
+    double max_fft_ms = 0.0;   // worst FFT time seen so far, across the whole run
+
     std::printf("FFT: accumulating %zu real samples per evaluation\n"
                 "  Eval rate:       %.2f /sec\n"
-                "  True resolution: %.2f Hz\n\n",
-                FFT_SIZE, resolution, resolution);   // eval rate == resolution == rate/N
+                "  True resolution: %.2f Hz\n"
+                "  Time budget:     %.2f ms per window (must stay under this)\n\n",
+                FFT_SIZE, resolution, resolution, budget_ms);
 
     while (true) {
         std::vector<std::complex<float>> batch;
@@ -122,7 +130,14 @@ void fft(SampleQueue& sq, size_t samples_per_packet, double rate, double center_
         if (window.size() < FFT_SIZE)
             continue;   // window not full yet — keep collecting batches
 
+        // Time the FFT itself — this is the number that determines whether
+        // the consumer can sustain the incoming rate (see budget_ms above).
+        auto fft_start = std::chrono::steady_clock::now();
         fft_inplace(window);   // window now holds FFT_SIZE frequency-domain bins
+        auto fft_end = std::chrono::steady_clock::now();
+        double fft_ms = std::chrono::duration<double, std::milli>(fft_end - fft_start).count();
+        if (fft_ms > max_fft_ms)
+            max_fft_ms = fft_ms;
 
         // Find the strongest bin, skipping DC (bin 0). Direct-conversion
         // receivers like the B205mini put an LO-leakage / DC-offset spike at
@@ -147,8 +162,11 @@ void fft(SampleQueue& sq, size_t samples_per_packet, double rate, double center_
         double signal_freq = center_freq + freq_offset;
 
         double magnitude = std::sqrt(peak_mag2) / static_cast<double>(n);
-        std::printf("Peak: %.5f MHz  (offset %+.3f kHz, bin %zu, mag %.4f)\n",
-                    signal_freq / 1e6, freq_offset / 1e3, peak_bin, magnitude);
+        std::printf("Peak: %.5f MHz  (offset %+.3f kHz, bin %zu, mag %.4f)  "
+                    "FFT: %.2f ms (max %.2f ms, budget %.2f ms)%s\n",
+                    signal_freq / 1e6, freq_offset / 1e3, peak_bin, magnitude,
+                    fft_ms, max_fft_ms, budget_ms,
+                    fft_ms > budget_ms ? "  <-- OVER BUDGET" : "");
 
         window.clear();   // start the next (non-overlapping) window; keeps capacity
     }
